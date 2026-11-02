@@ -141,6 +141,14 @@ lib/scripts/watch-window.ps1  等待并摆放窗口（三阶段校正）
 cordis.patch.yml          插入插件行
 ```
 
+## 赞赏
+
+如果这个插件帮你省了钱，欢迎扫码请作者喝一杯 ☕（纯属自愿，不影响使用和更新）
+
+<p align="center">
+  <img src="assets/reward-qr.png" alt="赞赏码" width="260">
+</p>
+
 ## English
 
 **dsh-test-window** picks the monitor that Agent-launched test windows open on. Choose a display once in Settings → 测试窗口 and every window started through the settings page or the `open_test_window` agent tool is moved, maximized and kept there — so a game or editor never pops up on top of the chat. Windows-only; uses two PowerShell helpers for DPI-aware monitor enumeration and a three-phase window-placement loop that survives apps restoring their own geometry.
@@ -149,6 +157,8 @@ cordis.patch.yml          插入插件行
 dsh plugin --profile desktop add "git+https://github.com/Aily-DSH/dsh-test-window.git"
 # restart the client once
 ```
+
+**Sponsor:** if this plugin saved you money, you can buy the author a coffee — scan `assets/reward-qr.png`.
 
 ## License
 
