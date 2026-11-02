@@ -1,0 +1,8 @@
+# dsh-test-window bundle patch: inserts its plugin row into the web roster.
+# The single row mounts BOTH halves — the host side (display enumeration, window
+# placement, the `open_test_window` tool and the dsh-test-window.* JSON routes)
+# and the browser side (scanned from the `dsh.client` manifest field and served
+# from this package's lib/client.js).
+- insert:
+    - id: test-window
+      name: 'dsh-test-window'
