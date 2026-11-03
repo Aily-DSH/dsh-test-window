@@ -1,6 +1,6 @@
 {
   "name": "dsh-test-window",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Pick the display that test windows open on: a dsh settings page chooses a monitor, and both that page and the open_test_window agent tool move the spawned window onto it",
   "type": "module",
   "engines": {

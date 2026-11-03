@@ -38,7 +38,7 @@
       accepts.
 #>
 param(
-  [Parameter(Mandatory = $true)][string]$PidFile,
+  [string]$PidFile = '',
   [Parameter(Mandatory = $true)][string]$OutFile,
   [Parameter(Mandatory = $true)][int]$X,
   [Parameter(Mandatory = $true)][int]$Y,
@@ -47,6 +47,16 @@ param(
   [switch]$Maximize,
   [switch]$TopMost,
   [switch]$Foreground,
+  # Who gets the keyboard when the window is up: never | idle | always.
+  # `idle` only raises the window when the user has not touched keyboard or mouse
+  # for IdleMs — that is what stops a launch from eating the middle of a sentence.
+  [string]$Focus = 'idle',
+  [int]$IdleMs = 1500,
+  # The command to start. Started here (not by the host) so it can be given a
+  # console whose window is never painted on the primary display.
+  [string]$Command = '',
+  [string]$Cwd = '',
+  [string]$SpawnFile = '',
   [string]$TitleContains = '',
   [int]$TimeoutMs = 20000,
   [int]$SettleMs = 6000,
@@ -55,6 +65,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $startedAt = Get-Date
+
+# `-Foreground` is the old spelling of the `always` policy.
+if ($Foreground) { $Focus = 'always' }
+if ($Focus -ne 'never' -and $Focus -ne 'always') { $Focus = 'idle' }
 
 Add-Type @'
 using System;
@@ -84,9 +98,103 @@ public static class WatchWin {
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
+  [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+  [DllImport("kernel32.dll")] public static extern uint GetTickCount();
 
   [StructLayout(LayoutKind.Sequential)]
   public struct RECT { public int Left, Top, Right, Bottom; }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct GUITHREADINFO {
+    public int cbSize;
+    public int flags;
+    public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+    public RECT rcCaret;
+  }
+
+  [DllImport("user32.dll")]
+  public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
+
+  public const int GUI_INMOVESIZE = 0x00000002;
+  public const int GUI_INMENUMODE = 0x00000004;
+  public const int GUI_POPUPMENUMODE = 0x00000010;
+
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+
+  /// <summary>A mouse button is physically held (drag, long press, rubber-band select).</summary>
+  public static bool MouseHeld() {
+    const int VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_MBUTTON = 0x04;
+    return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0
+        || (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0
+        || (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+  }
+
+  /// <summary>A menu is open somewhere: right-click context menu, menu bar, tray menu.</summary>
+  public static bool MenuOpen() {
+    bool open = false;
+    uint self = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+    EnumWindows((h, l) => {
+      uint pid;
+      GetWindowThreadProcessId(h, out pid);
+      if (pid == self) return true;
+      if (!IsWindowVisible(h)) return true;
+      var sb = new StringBuilder(64);
+      GetClassNameW(h, sb, sb.Capacity);
+      // #32768 is the class of every popup menu Windows draws.
+      if (sb.ToString() == "#32768") { open = true; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return open;
+  }
+
+  /// <summary>The foreground app is inside a menu loop or a move/size loop.</summary>
+  public static bool ForegroundInMode() {
+    IntPtr fg = GetForegroundWindow();
+    if (fg == IntPtr.Zero) return false;
+    uint thread = GetWindowThreadProcessId(fg, IntPtr.Zero);
+    if (thread == 0) return false;
+    var info = new GUITHREADINFO();
+    info.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+    if (!GetGUIThreadInfo(thread, ref info)) return false;
+    return (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE | GUI_INMOVESIZE)) != 0
+        || info.hwndMenuOwner != IntPtr.Zero;
+  }
+
+  /// <summary>
+  /// True while the user is moving or resizing this window (or holding it with
+  /// the mouse). Re-asserting the rectangle then snaps the window back under the
+  /// cursor, which is exactly what makes a drag fail; the watcher backs off
+  /// instead and lets the user decide where it lives.
+  /// </summary>
+  public static bool UserMoving(IntPtr hWnd) {
+    if (MouseHeld()) {
+      // Holding the window itself, or dragging from one of its edges.
+      uint ownThread = GetWindowThreadProcessId(hWnd, IntPtr.Zero);
+      IntPtr fg = GetForegroundWindow();
+      if (fg != IntPtr.Zero && GetWindowThreadProcessId(fg, IntPtr.Zero) == ownThread) return true;
+    }
+    uint thread = GetWindowThreadProcessId(hWnd, IntPtr.Zero);
+    if (thread == 0) return false;
+    var info = new GUITHREADINFO();
+    info.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+    if (!GetGUIThreadInfo(thread, ref info)) return false;
+    if ((info.flags & GUI_INMOVESIZE) != 0) return true;
+    // A drag also shows up as mouse capture on the window; require the button to
+    // be down so a completed click is not mistaken for one.
+    if (info.hwndCapture == hWnd && MouseHeld()) return true;
+    return false;
+  }
+
+  /// <summary>Milliseconds since the user last touched keyboard or mouse.</summary>
+  public static uint IdleMs() {
+    var info = new LASTINPUTINFO();
+    info.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+    if (!GetLastInputInfo(ref info)) return uint.MaxValue;
+    return unchecked(GetTickCount() - info.dwTime);
+  }
 
   public const uint SWP_NOACTIVATE = 0x0010;
   public const uint SWP_SHOWWINDOW = 0x0040;
@@ -202,6 +310,62 @@ public static class WatchWin {
     }
   }
 }
+
+/// <summary>
+/// Starts the test program in a *new console whose window is created hidden*.
+///
+/// Two cheaper options both have a flaw this avoids:
+///   - CREATE_NO_WINDOW / windowsHide: the program has no console handles, so a
+///     launcher script's `timeout`, `pause` or `set /p` fail immediately;
+///   - a plain visible console: Windows paints that black box on the primary
+///     display before anyone can move it — the flash the user sees.
+/// CREATE_NEW_CONSOLE keeps the console (and its handles) real, while
+/// STARTF_USESHOWWINDOW + SW_HIDE keeps the window from ever being shown. If the
+/// console turns out to be the test window after all, the watcher shows it
+/// itself once it sits on the right display.
+/// </summary>
+public static class SpawnWin {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct STARTUPINFO {
+    public int cb;
+    public string lpReserved;
+    public string lpDesktop;
+    public string lpTitle;
+    public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars;
+    public int dwFillAttribute, dwFlags;
+    public short wShowWindow, cbReserved2;
+    public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  public struct PROCESS_INFORMATION {
+    public IntPtr hProcess, hThread;
+    public int dwProcessId, dwThreadId;
+  }
+
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern bool CreateProcessW(string app, StringBuilder commandLine, IntPtr processAttributes,
+    IntPtr threadAttributes, bool inheritHandles, uint creationFlags, IntPtr environment,
+    string currentDirectory, ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInfo);
+
+  const uint CREATE_NEW_CONSOLE = 0x00000010;
+  const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+  const uint STARTF_USESHOWWINDOW = 0x00000001;
+  const short SW_HIDE = 0;
+
+  public static int Hidden(string app, string commandLine, string currentDirectory) {
+    var info = new STARTUPINFO();
+    info.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+    info.dwFlags = (int)STARTF_USESHOWWINDOW;
+    info.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION processInfo;
+    bool ok = CreateProcessW(app, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false,
+      CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT, IntPtr.Zero,
+      string.IsNullOrEmpty(currentDirectory) ? null : currentDirectory, ref info, out processInfo);
+    if (!ok) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    return processInfo.dwProcessId;
+  }
+}
 '@
 
 try { [WatchWin]::SetProcessDpiAwareness(2) | Out-Null } catch { }
@@ -242,6 +406,37 @@ foreach ($handle in $baselineHandles) {
 # once the watcher is already polling.
 try { Set-Content -LiteralPath "$OutFile.ready" -Value ([string]$PID) -Encoding ASCII -Force } catch { }
 
+# --------------------------------------------------------------- launching
+# The program is started here rather than by the host, because only a spawn with
+# CREATE_NEW_CONSOLE + SW_HIDE gives a console that works (`timeout`, `pause`,
+# `set /p` inside a .cmd launcher) without painting a black box on the primary
+# display first. That flash, plus the keyboard focus the console used to grab,
+# are the two things this avoids.
+$prevForeground = [WatchWin]::GetForegroundWindow()
+$spawnedPid = 0
+$spawnError = ''
+if ($Command -ne '') {
+  $comspec = $env:ComSpec
+  if (-not $comspec) { $comspec = "$env:SystemRoot\System32\cmd.exe" }
+  try {
+    # Same quoting the host's shell would use: /s strips exactly the outer pair.
+    $spawnedPid = [SpawnWin]::Hidden($comspec, ('/d /s /c "' + $Command + '"'), $Cwd)
+  } catch {
+    $spawnError = $_.Exception.Message
+  }
+  if ($SpawnFile -ne '') {
+    $spawnPayload = if ($spawnError -ne '') {
+      [pscustomobject]@{ ok = $false; error = $spawnError; command = $Command }
+    } else {
+      [pscustomobject]@{ ok = $true; pid = $spawnedPid; command = $Command }
+    }
+    try {
+      $spawnUtf8 = New-Object System.Text.UTF8Encoding($false)
+      [System.IO.File]::WriteAllText($SpawnFile, (ConvertTo-Json -InputObject $spawnPayload -Compress), $spawnUtf8)
+    } catch { }
+  }
+}
+
 # Tolerance for "the window is where we asked for it". Engines adjust their own
 # frame by a pixel or two (DPI rounding), which is not drift worth correcting.
 $tolerance = 2
@@ -275,6 +470,50 @@ function Test-OnTarget {
          ([Math]::Abs($Rect.h - $H) -le $tolerance)
 }
 
+# A window is placed, not necessarily activated. Whether this launch may take the
+# keyboard is the user's choice:
+#   always — raise the window (the old behaviour)
+#   idle   — raise it only when the user has not touched keyboard/mouse for
+#            IdleMs, so a launch never interrupts a sentence being typed
+#   never  — never raise it, and put the keyboard back if the program grabs it
+$gaveFocus = $false
+
+# The user is in the middle of something right now: a mouse button is held (drag,
+# rubber-band select, long press), a window is being moved, or a context menu is
+# open. Nothing here may compete with that — no snapping the rectangle back, no
+# keyboard changes — because that is what makes a drag or a menu click fail.
+function Test-UserBusy {
+  if ([WatchWin]::MouseHeld()) { return $true }
+  if ([WatchWin]::MenuOpen()) { return $true }
+  if ([WatchWin]::ForegroundInMode()) { return $true }
+  return $false
+}
+
+function Test-FocusAllowed {
+  if ($Foreground -or $Focus -eq 'always') { return $true }
+  if ($Focus -eq 'never') { return $false }
+  if (Test-UserBusy) { return $false }
+  return ([WatchWin]::IdleMs() -ge $IdleMs)
+}
+
+# Put the keyboard back where the user left it. Engines and toolkits call
+# SetForegroundWindow on their own window the moment it maps, which is what types
+# the user's next words into a game they did not ask to switch to. This runs while
+# the window settles, so the correction lands within a frame or two.
+function Restore-Focus {
+  param([IntPtr]$Handle, [int]$OwnerPid)
+  if ($script:gaveFocus) { return }
+  if (Test-UserBusy) { return }
+  if ($prevForeground -eq [IntPtr]::Zero) { return }
+  if (-not [WatchWin]::IsWindow($prevForeground)) { return }
+  $fg = [WatchWin]::GetForegroundWindow()
+  if ($fg -eq [IntPtr]::Zero -or $fg -eq $prevForeground) { return }
+  # Only reclaim the keyboard from the window we just placed (or its process):
+  # whatever else the user switched to in the meantime is none of our business.
+  if ($fg -ne $Handle -and [WatchWin]::PidOf($fg) -ne [uint32]$OwnerPid) { return }
+  [WatchWin]::BringToFront($prevForeground) | Out-Null
+}
+
 # Move a hidden window to the requested rectangle. No SHOWWINDOW flag: the
 # window stays hidden until the caller decides how it should appear, so nothing
 # is ever painted on the wrong display.
@@ -298,7 +537,10 @@ function Show-Placed {
     [WatchWin]::SetWindowPos($Handle, [WatchWin]::HWND_TOPMOST, $X, $Y, $W, $H,
       ([WatchWin]::SWP_NOACTIVATE -bor [WatchWin]::SWP_SHOWWINDOW)) | Out-Null
   }
-  if ($Foreground) { [WatchWin]::BringToFront($Handle) | Out-Null }
+  if (Test-FocusAllowed) {
+    [WatchWin]::BringToFront($Handle) | Out-Null
+    $script:gaveFocus = $true
+  }
 }
 
 # ------------------------------------------------------------------ discovery
@@ -333,23 +575,49 @@ function Get-ProcessTree {
   return $seen
 }
 
-# Best window to place, or $null. `Console` candidates are only used as a last
-# resort by the caller, so the wrapper's own console box never wins over the
-# program the wrapper just started.
+# Picking the window, in order of confidence:
+#   owned  — belongs to the process tree of the command          → take it at once
+#   fresh  — new window of a process started after this launch   → take it after a
+#            short grace, so the program's own window can still win over a helper
+#            window that merely appeared in the same second
+#   other  — any other window that appeared while we waited      → last resort
+#   console— the shell wrapper's console box                    → last resort
+# A window that was already on screen before the launch is never a candidate, so
+# the chat window (or anything the user already had open) can never be taken.
+$freshCache = @{}
+$launchMark = $startedAt.AddSeconds(-1)
+
+# Whether the command that was started for this watcher is still running. While
+# it is, its own window may still be about to appear.
+function Test-LauncherAlive {
+  foreach ($root in $roots) {
+    if (Get-Process -Id $root -ErrorAction SilentlyContinue) { return $true }
+  }
+  return $false
+}
+
+# Whether the process behind a window was started by this launch.
+function Test-FreshProcess {  param([uint32]$Owner)
+  if ($freshCache.ContainsKey($Owner)) { return $freshCache[$Owner] }
+  $isFresh = $false
+  try {
+    $info = Get-Process -Id $Owner -ErrorAction Stop
+    $isFresh = $info.StartTime -ge $launchMark
+  } catch {
+    $isFresh = $false
+  }
+  $freshCache[$Owner] = $isFresh
+  return $isFresh
+}
+
 function Get-Candidate {
   param($PidSet, [Int64[]]$Known)
-  $best = $null
-  $bestScore = -1
-  $bestConsole = $null
-  $bestConsoleScore = -1
+  $picked = @{ owned = $null; fresh = $null; other = $null; console = $null }
+  $scores = @{ owned = -1; fresh = -1; other = -1; console = -1 }
   [uint32[]]$pidArray = @()
   if ($PidSet -and $PidSet.Count -gt 0) { $pidArray = [uint32[]]@($PidSet) }
   foreach ($handle in [WatchWin]::Candidates($pidArray, $baselineArray)) {
     $key = $handle.ToInt64()
-    $owner = [WatchWin]::PidOf($handle)
-    $isNew = -not $baseline.Contains($key)
-    $owned = $PidSet -and $PidSet.Contains([uint32]$owner)
-    if (-not $isNew -and -not $owned) { continue }
     if ($Known -and ($Known -contains $key)) { continue }
     if ([WatchWin]::IsToolWindow($handle)) { continue }
     $class = [WatchWin]::ClassOf($handle)
@@ -360,30 +628,35 @@ function Get-Candidate {
     [WatchWin]::Rect($handle, [ref]$rx, [ref]$ry, [ref]$rw, [ref]$rh)
     # Ignore tiny helper windows (tooltips, IME bars, hidden message windows).
     if ($rw -lt 160 -or $rh -lt 120) { continue }
+    $visible = [WatchWin]::IsWindowVisible($handle)
+    $owner = [WatchWin]::PidOf($handle)
+    $owned = ($pidArray.Length -gt 0) -and ($pidArray -contains $owner)
     # Only a window the user can actually see is the test window. Engines and
     # drivers keep invisible windows around (see $helperClasses above) that are
     # easy to mistake for the real thing; the real window is mapped, then shown.
-    if (-not [WatchWin]::IsWindowVisible($handle)) { continue }
-    $visible = $true
+    # The one exception is the launcher console this watcher created hidden on
+    # purpose: for a console-only program that window *is* the answer, and it is
+    # shown by us once it sits on the target display.
+    if (-not $visible -and -not ($isConsole -and $owned)) { continue }
     $title = [WatchWin]::TitleOf($handle)
     if ($title.StartsWith('__wgl')) { continue }
     if ($TitleContains -ne '' -and -not $title.Contains($TitleContains)) { continue }
+    # The console box belongs to the wrapper even when the wrapper is in our own
+    # process tree, so it never counts as "owned": it is the last resort only.
+    if ($isConsole) { $tier = 'console' }
+    elseif ($owned) { $tier = 'owned' }
+    elseif (Test-FreshProcess -Owner $owner) { $tier = 'fresh' }
+    else { $tier = 'other' }
     $score = [int]([Math]::Min(($rw * $rh) / 1000, 900000))
     if ($title -ne '') { $score += 1000 }
-    if ($owned) { $score += 2000 }
-    $record = [pscustomobject]@{
-      handle = $handle; class = $class; title = $title; pid = [int]$owner
-      x = $rx; y = $ry; w = $rw; h = $rh; visible = $visible
-      console = $isConsole; newWindow = $isNew
-    }
-    if ($isConsole) {
-      if ($score -gt $bestConsoleScore) { $bestConsoleScore = $score; $bestConsole = $record }
-    } elseif ($score -gt $bestScore) {
-      $bestScore = $score
-      $best = $record
+    if ($score -le $scores[$tier]) { continue }
+    $scores[$tier] = $score
+    $picked[$tier] = [pscustomobject]@{
+      handle = $handle; class = $class; title = $title; pid = [int]$owner; tier = $tier
+      x = $rx; y = $ry; w = $rw; h = $rh; visible = $visible; console = $isConsole
     }
   }
-  return [pscustomobject]@{ best = $best; console = $bestConsole }
+  return [pscustomobject]@{ owned = $picked.owned; fresh = $picked.fresh; other = $picked.other; console = $picked.console }
 }
 
 $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
@@ -391,33 +664,59 @@ $roots = @()
 $pidSet = New-Object System.Collections.Generic.HashSet[uint32]
 $known = New-Object System.Collections.Generic.List[Int64]
 
-# Wait for the host to hand over the process ids.
-while ((Get-Date) -lt $deadline) {
-  if (Test-Path -LiteralPath $PidFile) {
-    try {
-      $raw = Get-Content -LiteralPath $PidFile -Raw
-      if ($raw) {
-        $parsed = $raw | ConvertFrom-Json
-        if ($parsed -and $parsed.pids) {
-          $roots = @()
-          foreach ($value in $parsed.pids) { $roots += [uint32]$value; [void]$pidSet.Add([uint32]$value) }
-          break
+# The program started above already gives us the root of the tree. The PidFile
+# handshake is kept for the case where the host starts the program itself.
+if ($spawnedPid -gt 0) {
+  $roots = @([uint32]$spawnedPid)
+  foreach ($value in $roots) { [void]$pidSet.Add($value) }
+} elseif ($PidFile -ne '') {
+  while ((Get-Date) -lt $deadline) {
+    if (Test-Path -LiteralPath $PidFile) {
+      try {
+        $raw = Get-Content -LiteralPath $PidFile -Raw
+        if ($raw) {
+          $parsed = $raw | ConvertFrom-Json
+          if ($parsed -and $parsed.pids) {
+            $roots = @()
+            foreach ($value in $parsed.pids) { $roots += [uint32]$value; [void]$pidSet.Add([uint32]$value) }
+            break
+          }
         }
-      }
-    } catch { }
+      } catch { }
+    }
+    Start-Sleep -Milliseconds 10
   }
-  Start-Sleep -Milliseconds 10
 }
 
 # The timeout is about waiting for the *window*, so it starts now, not when this
 # watcher was booted.
 $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+
+# Nothing to wait for when the command never started: report it at once instead
+# of sitting out the whole timeout.
+if ($spawnError -ne '') {
+  $failed = [pscustomobject]@{
+    ok = $false; reason = 'spawn-failed'; error = $spawnError; command = $Command
+    waitedMs = [int]((Get-Date) - $startedAt).TotalMilliseconds
+  }
+  $failedJson = ConvertTo-Json -InputObject $failed -Compress
+  try {
+    $failedUtf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($OutFile, $failedJson, $failedUtf8)
+  } catch { }
+  $failedJson
+  exit 4
+}
+
 $tree = Get-ProcessTree -Roots $roots
 foreach ($p in $tree) { [void]$pidSet.Add($p) }
 $lastTreeScan = Get-Date
 
 $target = $null
 $consoleFallback = $null
+$otherFallback = $null
+$pending = $null
+$pendingAt = $null
 
 while ((Get-Date) -lt $deadline) {
   if (((Get-Date) - $lastTreeScan).TotalMilliseconds -ge 300) {
@@ -426,18 +725,48 @@ while ((Get-Date) -lt $deadline) {
     $lastTreeScan = Get-Date
   }
   $found = Get-Candidate -PidSet $pidSet -Known $known
-  if ($found.best) { $target = $found.best; break }
+  # A window of the command's own process tree is the answer, no need to wait.
+  if ($found.owned) { $target = $found.owned; break }
+  # A window of a newly started process is very likely the program too, but a
+  # launcher can also flash its own helper window first, and another launch on
+  # the same machine can put a window on screen at the same moment: only commit
+  # to a stranger once the launcher itself has exited without a window of its own.
+  if ($found.fresh) {
+    if (-not $pending) {
+      $pending = $found.fresh
+      $pendingAt = Get-Date
+    } elseif (((Get-Date) - $pendingAt).TotalMilliseconds -ge 900 -and -not (Test-LauncherAlive)) {
+      $target = $pending
+      break
+    }
+  }
   if ($found.console) { $consoleFallback = $found.console }
+  if ($found.other) { $otherFallback = $found.other }
   Start-Sleep -Milliseconds 12
 }
 
+if (-not $target) { $target = $pending }
+if (-not $target) { $target = $otherFallback }
 # Nothing that looks like an app window: fall back to the console box the
 # launcher was started in, which is what a console-only program shows.
 if (-not $target) { $target = $consoleFallback }
 
 if (-not $target) {
+  # A launcher that already exited with a non-zero code never had a chance to
+  # open anything: say so instead of blaming the timeout.
+  $exitCode = $null
+  if ($spawnedPid -gt 0) {
+    try {
+      $launcher = [System.Diagnostics.Process]::GetProcessById($spawnedPid)
+      if ($launcher.HasExited) { $exitCode = $launcher.ExitCode }
+    } catch { }
+  }
+  $failedBecauseExit = ($null -ne $exitCode) -and ($exitCode -ne 0)
   $none = [pscustomobject]@{
-    ok = $false; reason = 'no-window'; pids = @($pidSet)
+    ok = $false
+    reason = if ($failedBecauseExit) { 'command-failed' } else { 'no-window' }
+    exitCode = $exitCode
+    pids = @($pidSet)
     waitedMs = [int]((Get-Date) - $startedAt).TotalMilliseconds
   }
   $noneJson = ConvertTo-Json -InputObject $none -Compress
@@ -465,6 +794,10 @@ if ($firstVisible) {
 # target display).
 Move-Window -Handle $handle
 Show-Placed -Handle $handle -MaximizeNow ([bool]$Maximize)
+# The program may already have asked for the foreground while it mapped its
+# window; give the keyboard straight back when it did.
+Start-Sleep -Milliseconds 30
+Restore-Focus -Handle $handle -OwnerPid $ownerPid
 
 # Phase 2: settle. Applications such as the Godot 4 editor restore their own
 # saved geometry (and even their own maximized state) after the first frames, so
@@ -473,9 +806,34 @@ $attempts = 1
 $replaced = 0
 $maximizeNow = [bool]$Maximize
 $maximizeTries = 0
-$settleUntil = (Get-Date).AddMilliseconds([Math]::Max($SettleMs, 500))
-while ((Get-Date) -lt $settleUntil) {
+$userMoved = $false
+$settleBudget = [Math]::Max($SettleMs, 500)
+$settleStarted = Get-Date
+$pausedMs = 0
+# Time spent waiting for the user to finish something cannot be spent on
+# correcting the placement, so it does not eat the budget — but a single long
+# session (a menu left open, a drag that never ends) cannot hold the watcher
+# hostage forever either.
+$hardStop = $settleStarted.AddMilliseconds($settleBudget + 20000)
+while ((Get-Date) -lt $hardStop) {
   Start-Sleep -Milliseconds 50
+
+  # The user grabbed the window itself: re-asserting the rectangle would snap it
+  # back under their cursor and break the drag. The placement is theirs now.
+  if ([WatchWin]::UserMoving($handle)) {
+    $userMoved = $true
+    break
+  }
+  # Anything else the user is doing (holding a menu open, dragging something
+  # else, a long press) only pauses the correction, so the window still ends up
+  # in the right place once they let go.
+  if (Test-UserBusy) {
+    $pausedMs += 50
+    continue
+  }
+  if (((Get-Date) - $settleStarted).TotalMilliseconds - $pausedMs -ge $settleBudget) { break }
+  # Keep the keyboard where the user left it while the window settles.
+  Restore-Focus -Handle $handle -OwnerPid $ownerPid
 
   # The program may throw its window away and create a new one (engine splash,
   # renderer switch). Adopt the replacement instead of reporting it as closed.
@@ -487,7 +845,8 @@ while ((Get-Date) -lt $settleUntil) {
       $tree = Get-ProcessTree -Roots $roots
       foreach ($p in $tree) { [void]$pidSet.Add($p) }
       $found = Get-Candidate -PidSet $pidSet -Known $known
-      if ($found.best) { $swap = $found.best }
+      if ($found.owned) { $swap = $found.owned }
+      elseif ($found.fresh) { $swap = $found.fresh }
       else { Start-Sleep -Milliseconds 40 }
     }
     if (-not $swap) { break }
@@ -557,7 +916,7 @@ if (-not [WatchWin]::IsWindow($handle)) {
   $goneJson
   exit 3
 }
-if ($maximizeNow -and -not [WatchWin]::IsZoomed($handle)) {
+if ($maximizeNow -and -not [WatchWin]::IsZoomed($handle) -and -not $userMoved) {
   Move-Window -Handle $handle
   [WatchWin]::ShowWindow($handle, [WatchWin]::SW_MAXIMIZE) | Out-Null
   Start-Sleep -Milliseconds 400
@@ -566,7 +925,7 @@ if ($maximizeNow -and -not [WatchWin]::IsZoomed($handle)) {
 $final = Get-WindowRect -Handle $handle
 $zoomed = [bool][WatchWin]::IsZoomed($handle)
 $inside = Test-OnMonitor -Rect $final -Maximized ($maximizeNow -and $zoomed)
-if (-not $inside) {
+if (-not $inside -and -not $userMoved) {
   # Last resort: a plain work-area sized window, the placement every app accepts.
   [WatchWin]::ShowWindow($handle, [WatchWin]::SW_RESTORE) | Out-Null
   [WatchWin]::ShowWindow($handle, [WatchWin]::SW_HIDE) | Out-Null
@@ -582,11 +941,14 @@ if (-not $inside) {
 
 # The title is usually empty at the moment a window is first mapped; re-read it
 # now that the settle loop has given the app time to set it.
+Restore-Focus -Handle $handle -OwnerPid $ownerPid
 $settledTitle = [WatchWin]::TitleOf($handle)
 if ($settledTitle) { $title = $settledTitle }
 $payload = [pscustomobject]@{
-  ok            = $inside
-  reason        = if ($inside) { $null } else { 'outside-target-display' }
+  # A window the user dragged somewhere else is not a failure: it is where they
+  # want it. Only a placement we made ourselves can be "outside the display".
+  ok            = ($inside -or $userMoved)
+  reason        = if ($inside -or $userMoved) { $null } else { 'outside-target-display' }
   handle        = $handle.ToInt64()
   pid           = $ownerPid
   title         = $title
@@ -599,10 +961,13 @@ $payload = [pscustomobject]@{
   maximizeFellBack = ([bool]$Maximize -and -not [bool]$maximizeNow)
   zoomed        = [bool]$zoomed
   inside        = [bool]$inside
+  userMoved     = [bool]$userMoved
   attempts      = [int]$attempts
   replaced      = [int]$replaced
   console       = [bool]$target.console
   class         = $target.class
+  focus         = $Focus
+  focusGiven    = [bool]$script:gaveFocus
   targetX       = $X
   targetY       = $Y
   targetWidth   = $W

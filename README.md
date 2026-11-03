@@ -25,11 +25,14 @@
 - 🖥️ **显示器选择**：设置页列出真实物理屏幕（DPI 感知、物理像素、含坐标/工作区/是否主屏），点选即存
 - 🔍 **认得准窗口**：只认启动后新出现的可见窗口——启动脚本几秒后才拉起的程序、交给 explorer 打开的程序都能命中；GPU 驱动/引擎创建的隐藏辅助窗口（如 Godot 4 + NVIDIA 的 `NVOpenGLPbuffer`）和控制台黑框不会被误当成目标
 - 🪟 **自动摆放并保持**：等到进程窗口出现后移动/最大化到目标屏，并在 `settleMs`（默认 6 秒）内持续校正——引擎常会回写自己保存的窗口几何
+- 🕶️ **不闪控制台**：程序在一个「创建即隐藏」的新控制台里启动（`CREATE_NEW_CONSOLE` + `SW_HIDE`），主屏不会闪一下黑框；`.bat` 里的 `timeout` / `pause` 依然正常
+- ⌨️ **不抢键盘**：焦点策略三档（从不 / 空闲时 / 总是），默认「空闲时」——你正在打字、拖动、长按、开着右键菜单时，新窗口只摆好位置、不上前；程序自己抢走的焦点会被还回去
+- ✋ **不打断你的操作**：检测到鼠标按着、窗口正在移动/缩放、或弹出菜单打开时，暂停位置校正并把位置交给你，绝不和你的拖动抢
 - ♻️ **窗口重建也能跟上**：程序把窗口销毁重建（引擎切换渲染后端）时，跟上新窗口而不是报「窗口已关闭」
 - 🔁 **失败自动降级**：程序顽固拒绝最大化时，退化为「铺满目标屏工作区」的普通窗口，而不是留下一个越界窗口
 - 🎯 **精确判定**：最大化窗口天然比屏幕大 8 像素（边框），判定逻辑对最大化态放宽，不会把正确结果误判成越界
-- 🧰 **Agent 工具**：`open_test_window(command, cwd?, displayIndex?, titleContains?, maximize?, topMost?, foreground?, timeoutMs?, settleMs?)`
-- 🚪 **如实回报**：窗口被程序关掉会明确返回 `window-closed`，不会假装成功
+- 🧰 **Agent 工具**：`open_test_window(command, cwd?, displayIndex?, titleContains?, maximize?, topMost?, focus?, timeoutMs?, settleMs?)`，并会把「要开窗口就用它」写进每个会话的系统提示
+- 🚪 **如实回报**：窗口被程序关掉返回 `window-closed`，命令启动失败返回 `spawn-failed` / `command-failed`（带退出码），不会假装成功
 - 🌐 仅本机：所有 HTTP 路由只接受回环地址
 
 ## 环境要求
@@ -57,7 +60,7 @@ dsh plugin --profile desktop add "file:/D:/path/to/dsh-test-window"
 ## 快速上手
 
 1. 设置 → 测试窗口，从列表里选一块屏（例如 `2 · 1920×1080 @ 640,-1080`）
-2. 勾选「最大化」「置顶」「切到前台」等选项，保存
+2. 勾选「最大化」「置顶」，选「窗口出来之后谁拿键盘焦点」（默认「空闲时才切到前台」），保存
 3. 在「立即启动命令」里填一个命令点启动，例如 `godot --path D:/GC/MyGame`，看窗口是否落在目标屏
 4. 之后让 Agent 拉窗口时，它会自动带上这个设置
 
@@ -73,11 +76,12 @@ dsh plugin --profile desktop add "file:/D:/path/to/dsh-test-window"
 | `titleContains` | string | 窗口标题子串；命令把窗口交给别的进程时（浏览器）用它命中 |
 | `maximize` | boolean | 覆盖「最大化」 |
 | `topMost` | boolean | 覆盖「置顶」 |
-| `foreground` | boolean | 覆盖「切前台」 |
+| `focus` | `never` / `idle` / `always` | 覆盖焦点策略 |
+| `foreground` | boolean | 旧参数：`true` = `focus: always`，`false` = `never` |
 | `timeoutMs` | number | 等窗口出现的最长毫秒数 |
 | `settleMs` | number | 窗口出现后继续校正矩形的时长（慢引擎可调大） |
 
-返回结构含 `window`（`ok / pid / title / x / y / width / height / zoomed / inside / attempts / maximizeFellBack`）与 `display`，并在工具输出里渲染成一句中文说明。
+返回结构含 `window`（`ok / pid / title / x / y / width / height / zoomed / inside / userMoved / focusGiven / attempts / maximizeFellBack`）与 `display`，并在工具输出里渲染成一句中文说明。
 
 ## 配置
 
@@ -89,7 +93,8 @@ dsh plugin --profile desktop add "file:/D:/path/to/dsh-test-window"
 | `device` | `""` | 设备名，如 `\\.\DISPLAY2` |
 | `maximize` | `true` | 摆放后是否最大化 |
 | `topMost` | `false` | 是否置顶 |
-| `foreground` | `true` | 是否切到前台 |
+| `focus` | `idle` | 焦点策略：`never` 从不 / `idle` 空闲时 / `always` 总是 |
+| `focusIdleMs` | `1500` | `idle` 的判定阈值：用户超过这么久没动键盘鼠标，才允许把窗口切到前面 |
 | `timeoutMs` | `20000` | 等窗口出现的超时 |
 | `settleMs` | `6000` | 窗口出现后持续校正的时长 |
 | `lastCommand`/`lastCwd` | `""` | 上次启动的命令，方便复跑 |
@@ -107,23 +112,37 @@ dsh plugin --profile desktop add "file:/D:/path/to/dsh-test-window"
 
 ```
 launch(command)
-  └─ spawn 子进程（独立控制台，PID 写入 pidFile）
-       └─ watch-window.ps1 -Pid <pid> -X/-Y/-W/-H <目标矩形> -Maximize ...
-            Phase 0  记录启动前已有的窗口快照，挑窗口时用来判断「哪些是这次新冒出来的」
-            Phase 1  等窗口出现（-TimeoutMs），每 300ms 重读进程树；隐藏状态下摆位，再显示，最后最大化
-            Phase 2  每 50ms 校验矩形，漂移就重启摆位；最大化最多重试 6 次；窗口被销毁则接管新窗口
-            Phase 3  最终校验；没有可见窗口 → no-window，窗口已关闭 → window-closed
+  └─ spawn watch-window.ps1（隐藏窗口；先热身，写 ready 文件）
+       Phase 0  记录启动前已有的窗口快照（之后判断「哪些是这次新冒出来的」）
+       ├─ 由它启动命令：CreateProcess + CREATE_NEW_CONSOLE + SW_HIDE
+       │    控制台真实存在（timeout/pause 可用），但窗口从不显示 → 不闪、不抢焦点
+       │    PID 写回 spawn 文件，连同一棵树作为窗口归属依据
+       Phase 1  等窗口出现（-TimeoutMs），每 300ms 重读进程树；隐藏状态下摆位，再显示，最后最大化
+       Phase 2  每 50ms 校验矩形，漂移就重启摆位；最大化最多重试 6 次；窗口被销毁则接管新窗口
+                · 用户按着鼠标 / 正在移动窗口 / 开着菜单 → 暂停校正（拖到窗口上时直接停手）
+                · 没被授权抢焦点时，谁抢走焦点就把焦点还回去
+       Phase 3  最终校验；没有可见窗口 → no-window（启动器非零退出 → command-failed）
   └─ 读取结果 JSON，交给设置页或 open_test_window 返回
 ```
+
+### 为什么不闪、不抢
+
+| 老做法 | 问题 | 现在 |
+| --- | --- | --- |
+| `shell + detached + windowsHide:false` | 生成**可见**控制台，主屏闪一下黑框，还会把键盘焦点抢走 | `CREATE_NEW_CONSOLE + SW_HIDE`：控制台真实存在但从不显示 |
+| `windowsHide:true` | 没有控制台句柄，`.bat` 里的 `timeout` / `pause` / `set /p` 直接失败 | 同上，句柄完整 |
+| 启动后 `SetForegroundWindow` | 你正在打字，焦点被抢走、输入被打断 | 默认「空闲时」策略：有输入活动时不切前台；程序自己抢的一律还回去 |
+| settle 阶段每 50ms 重新摆位 | 你拖动窗口时被拽回原位、菜单被点掉 | 检测到按住鼠标 / 移动窗口 / 菜单打开就暂停或停手 |
 
 ### 它会挑哪个窗口
 
 「测试窗口」指的永远是**程序自己弹出来的那个可见主窗口**，所以挑选规则是：
 
 1. 只认**可见**窗口，且不是桌面/托盘/输入法/工具窗这类系统装饰；
-2. 进程属于本次命令的进程树，**或**在启动前快照里不存在（覆盖 `start steam://…` 这种交给 explorer 打开的情况）；
-3. 进程树每 300ms 重读一次——`.bat` / `npm` 这类启动器往往几秒后才拉起真正的程序，只在启动瞬间抓一次 PID 是抓不到的；
-4. 排除 GPU 驱动/引擎的隐藏辅助窗口（`NVOpenGLPbuffer`、`__wglDummyWindow*` 等）与控制台窗口；只有在超时前始终没有其它窗口时，才把启动它的控制台窗口当作结果。
+2. **启动前已经存在的窗口一律不算**——聊天窗口、你本来开着的程序永远抓不到；
+3. 按可信度分四档：`owned`（属于命令的进程树）> `fresh`（属于本次启动后才起的新进程）> `other`（等待期间新冒出来的窗口）> `console`（启动它的那个黑框）。`owned` 命中就立刻落地；`fresh` 要等启动器退出、且过了 900ms 才认，免得抢到同一时刻其它程序的新窗口；`other`/`console` 只在超时前什么都没等到时才兜底；
+4. 进程树每 300ms 重读一次——`.bat` / `npm` 这类启动器往往几秒后才拉起真正的程序，只在启动瞬间抓一次 PID 是抓不到的；
+5. 排除 GPU 驱动/引擎的隐藏辅助窗口（`NVOpenGLPbuffer`、`__wglDummyWindow*` 等）。
 
 要点：
 
