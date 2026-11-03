@@ -1,5 +1,8 @@
 # dsh-test-window
 
+[![dsh-plugin](https://img.shields.io/badge/GitHub%20topic-dsh--plugin-3b82f6)](https://github.com/topics/dsh-plugin) [![awesome-dsh-plugins](https://img.shields.io/badge/awesome--dsh--plugins-PR%20open-6b7280)](https://github.com/cccakeee/awesome-dsh-plugins)
+
+
 > 给 DeepSeek Harness 的「测试窗口落哪块屏」插件：在设置里选显示器，Agent 拉起的游戏/编辑器/预览窗口就会开在那块屏上，不再盖住 DSH 窗口。
 
 [English](#english) · [安装](#安装) · [快速上手](#快速上手) · [Agent 工具](#agent-工具open_test_window) · [配置](#配置)
@@ -148,6 +151,19 @@ cordis.patch.yml          插入插件行
 <p align="center">
   <img src="assets/reward-qr.png" alt="赞赏码" width="260">
 </p>
+
+## 生态与收录
+
+- **GitHub topic**：[dsh-plugin](https://github.com/topics/dsh-plugin)——DSH 社区约定的插件标记，本仓库已加上
+  `dsh` / `dsh-plugin` / `deepseek-harness` / `plugin` 等 topics。
+- **社区目录**：已向 [cccakeee/awesome-dsh-plugins](https://github.com/cccakeee/awesome-dsh-plugins) 提交收录 PR；
+  收录后可在 [deepseekharnessplugins.com](https://deepseekharnessplugins.com) 与
+  [awesome-dsh-plugin.com](https://awesome-dsh-plugin.com) 搜到。
+- **客户端插件市场**：DSH 的「设置 → 插件市场」只读**配置里的索引 URL**（不搜 npm）。索引格式 1 的示例见
+  [Aily-DSH/dsh-plugin-index](https://github.com/Aily-DSH/dsh-plugin-index)，把它的 jsDelivr 地址加进
+  `dsh.profile.indexes` 即可在客户端内直接看到 dsh-test-window。
+- **查不到时**：npm / GitHub 搜索有索引延迟，新包一般 1–3 天；先用
+  `dsh plugin --profile desktop add git+https://github.com/Aily-DSH/dsh-test-window.git` 直接装。
 
 ## English
 

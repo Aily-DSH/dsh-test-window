@@ -8,17 +8,30 @@
   rectangle, and only then shows it again. That removes the visible flash.
 
   Handshake:
-    1. after Add-Type finishes it writes <OutFile>.ready
+    1. after Add-Type finishes the baseline window set is captured, then
+       <OutFile>.ready is written
     2. the host spawns the program and writes the process ids into PidFile
     3. this script applies the rectangle, then writes the JSON result to OutFile
+
+  Which window it picks (the part that used to be wrong):
+    * the process id list is the *root* of a tree, and the tree is re-read while
+      polling: a launcher script (cmd, a .bat, npm) starts the real program a
+      few seconds later, so a one-shot snapshot never contains it;
+    * windows that did not exist before the launch count too, because launchers
+      such as `start steam://…` hand the program to explorer, which is not a
+      descendant of the launcher at all;
+    * console windows (the cmd/conhost box a wrapper is started in) are not the
+      test window. They are only used as a last resort, when nothing else
+      appeared before the timeout.
 
   Placement rules (learned from real apps):
     * A hidden window is moved first, then shown, and only then maximized: a
       maximized hidden window is clamped against the monitor it currently
       belongs to, which is how a window ends up half outside the target screen.
     * Some programs (Godot 4 editors among them) re-apply their own saved
-      geometry right after creation, so the rectangle is re-asserted for a few
-      seconds instead of once.
+      geometry right after creation, or recreate their window entirely, so the
+      rectangle is re-asserted for a few seconds and a dead handle is replaced
+      by the new window of the same program.
     * The final rectangle is verified against the target display. When the app
       keeps fighting, the watcher falls back to a plain work-area sized window
       instead of a maximized one, because that placement is the one every app
@@ -59,6 +72,8 @@ public static class WatchWin {
   [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int count);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLengthW(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int index);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
@@ -82,19 +97,36 @@ public static class WatchWin {
   public const int SW_SHOW = 5;
   public const int SW_RESTORE = 9;
   public const int SW_MAXIMIZE = 3;
+  public const int GWL_EXSTYLE = -20;
+  public const int WS_EX_TOOLWINDOW = 0x00000080;
   public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
   public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
 
+  /// <summary>Every top-level window of the given processes.</summary>
   public static List<IntPtr> All(uint[] pids) {
     bool any = pids.Length == 0;
     var wanted = new HashSet<uint>(pids);
+    uint self = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
     var found = new List<IntPtr>();
     EnumWindows((hWnd, lParam) => {
       uint pid;
       GetWindowThreadProcessId(hWnd, out pid);
+      if (pid == self) return true;
       if (!any && !wanted.Contains(pid)) return true;
-      // Skip windows owned by this watcher (powershell console or hidden host).
-      if (pid == (uint)System.Diagnostics.Process.GetCurrentProcess().Id) return true;
+      found.Add(hWnd);
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+
+  /// <summary>Every top-level window, ignoring the owning process.</summary>
+  public static List<IntPtr> Every() {
+    uint self = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+    var found = new List<IntPtr>();
+    EnumWindows((hWnd, lParam) => {
+      uint pid;
+      GetWindowThreadProcessId(hWnd, out pid);
+      if (pid == self) return true;
       found.Add(hWnd);
       return true;
     }, IntPtr.Zero);
@@ -105,6 +137,22 @@ public static class WatchWin {
     var sb = new StringBuilder(512);
     GetWindowTextW(hWnd, sb, sb.Capacity);
     return sb.ToString();
+  }
+
+  public static string ClassOf(IntPtr hWnd) {
+    var sb = new StringBuilder(256);
+    GetClassNameW(hWnd, sb, sb.Capacity);
+    return sb.ToString();
+  }
+
+  public static bool IsToolWindow(IntPtr hWnd) {
+    return (GetWindowLong(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0;
+  }
+
+  public static uint PidOf(IntPtr hWnd) {
+    uint pid;
+    GetWindowThreadProcessId(hWnd, out pid);
+    return pid;
   }
 
   public static void Rect(IntPtr hWnd, out int x, out int y, out int w, out int h) {
@@ -137,87 +185,25 @@ public static class WatchWin {
 try { [WatchWin]::SetProcessDpiAwareness(2) | Out-Null } catch { }
 try { [WatchWin]::SetProcessDPIAware() | Out-Null } catch { }
 
+# Windows that are never the test window. Console hosts are handled separately
+# (they are the shell wrapper, not the app), the rest is desktop chrome.
+$chromeClasses = @(
+  'ConsoleWindowClass', 'PseudoConsoleWindow', 'CASCADIA_HOSTING_WINDOW_CLASS',
+  'Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd',
+  'NotifyIconOverflowWindow', 'tooltips_class32', 'MSCTFIME UI', 'IME',
+  'GDI+ Hook Window Class', 'SysShadow', 'TaskListThumbnailWnd',
+  'Windows.UI.Core.CoreWindow', 'ApplicationManager_ImmersiveShellWindow'
+)
+
+# Everything that is already on screen before the program starts. A window that
+# is not in here appeared because of this launch, even when the launcher handed
+# the program to another process (explorer, a service, an existing instance).
+$baseline = New-Object System.Collections.Generic.HashSet[Int64]
+foreach ($handle in [WatchWin]::Every()) { [void]$baseline.Add($handle.ToInt64()) }
+
 # Ready handshake: the host waits for this file, so the program is only started
 # once the watcher is already polling.
 try { Set-Content -LiteralPath "$OutFile.ready" -Value ([string]$PID) -Encoding ASCII -Force } catch { }
-
-$deadline = (Get-Date).AddMilliseconds($TimeoutMs)
-$pidList = @()
-
-# Wait for the host to hand over the process ids.
-while ((Get-Date) -lt $deadline) {
-  if (Test-Path -LiteralPath $PidFile) {
-    try {
-      $raw = Get-Content -LiteralPath $PidFile -Raw
-      if ($raw) {
-        $parsed = $raw | ConvertFrom-Json
-        if ($parsed -and $parsed.pids) {
-          $pidList = @()
-          foreach ($value in $parsed.pids) { $pidList += [uint32]$value }
-          break
-        }
-      }
-    } catch { }
-  }
-  Start-Sleep -Milliseconds 10
-}
-
-if ($IncludeChildren -and $pidList.Count -gt 0) {
-  $seen = New-Object System.Collections.Generic.HashSet[int]
-  $queue = New-Object System.Collections.Generic.Queue[int]
-  foreach ($rootPid in $pidList) { [void]$seen.Add([int]$rootPid); [void]$queue.Enqueue([int]$rootPid) }
-  $all = @()
-  foreach ($process in (Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId)) {
-    $all += ,@([int]$process.ProcessId, [int]$process.ParentProcessId)
-  }
-  while ($queue.Count -gt 0) {
-    $current = $queue.Dequeue()
-    foreach ($pair in $all) {
-      if ($pair[1] -eq $current -and $seen.Add($pair[0])) { [void]$queue.Enqueue($pair[0]) }
-    }
-  }
-  $pidList = @($seen)
-}
-
-$target = [IntPtr]::Zero
-$title = ''
-$ownerPid = 0
-$hiddenAt = 0
-$firstX = 0; $firstY = 0; $firstW = 0; $firstH = 0; $firstVisible = $false
-
-# Tight loop: the first moment a window exists we hide it, so it never paints on
-# the wrong display.
-while ((Get-Date) -lt $deadline) {
-  foreach ($handle in [WatchWin]::All([uint32[]]$pidList)) {
-    $candidate = [WatchWin]::TitleOf($handle)
-    if ($TitleContains -ne '' -and -not $candidate.Contains($TitleContains)) { continue }
-    $cx = 0; $cy = 0; $cw = 0; $ch = 0
-    [WatchWin]::Rect($handle, [ref]$cx, [ref]$cy, [ref]$cw, [ref]$ch)
-    # Ignore tiny helper windows (tooltips, IME bars, hidden message windows).
-    if ($cw -lt 120 -or $ch -lt 80) { continue }
-    $target = $handle
-    $title = $candidate
-    $owner = [uint32]0
-    [WatchWin]::GetWindowThreadProcessId($handle, [ref]$owner) | Out-Null
-    $ownerPid = [int]$owner
-    # Record where the window was born: if it is already on the target display,
-    # nothing was ever painted over the primary screen.
-    $firstX = $cx; $firstY = $cy; $firstW = $cw; $firstH = $ch
-    $firstVisible = [WatchWin]::IsWindowVisible($target)
-    [WatchWin]::ShowWindow($target, [WatchWin]::SW_HIDE) | Out-Null
-    $hiddenAt = (Get-Date)
-    break
-  }
-  if ($target -ne [IntPtr]::Zero) { break }
-  # 8 ms: fast enough to catch a window created in the same frame, cheap enough
-  # to run for the whole timeout.
-  Start-Sleep -Milliseconds 8
-}
-
-if ($target -eq [IntPtr]::Zero) {
-  ConvertTo-Json -InputObject ([pscustomobject]@{ ok = $false; reason = 'no-window'; pids = $pidList }) -Compress
-  exit 2
-}
 
 # Tolerance for "the window is where we asked for it". Engines adjust their own
 # frame by a pixel or two (DPI rounding), which is not drift worth correcting.
@@ -278,61 +264,243 @@ function Show-Placed {
   if ($Foreground) { [WatchWin]::BringToFront($Handle) | Out-Null }
 }
 
+# ------------------------------------------------------------------ discovery
+
+# Descendant process ids of the launcher. The launcher of a test window is very
+# often a script, so this is re-read while polling: the program may be started
+# seconds after the script itself, and the parent is usually gone by then.
+function Get-ProcessTree {
+  param([uint32[]]$Roots)
+  $seen = New-Object System.Collections.Generic.HashSet[uint32]
+  if ($Roots.Count -eq 0) { return $seen }
+  $children = @{}
+  foreach ($process in (Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId)) {
+    $parent = [uint32]$process.ParentProcessId
+    if (-not $children.ContainsKey($parent)) {
+      $children[$parent] = New-Object System.Collections.Generic.List[uint32]
+    }
+    $children[$parent].Add([uint32]$process.ProcessId)
+  }
+  $queue = New-Object System.Collections.Generic.Queue[uint32]
+  foreach ($root in $Roots) {
+    if ($seen.Add($root)) { $queue.Enqueue($root) }
+  }
+  while ($queue.Count -gt 0) {
+    $current = $queue.Dequeue()
+    if ($children.ContainsKey($current)) {
+      foreach ($child in $children[$current]) {
+        if ($seen.Add($child)) { $queue.Enqueue($child) }
+      }
+    }
+  }
+  return $seen
+}
+
+# Best window to place, or $null. `Console` candidates are only used as a last
+# resort by the caller, so the wrapper's own console box never wins over the
+# program the wrapper just started.
+function Get-Candidate {
+  param($PidSet, [Int64[]]$Known)
+  $best = $null
+  $bestScore = -1
+  $bestConsole = $null
+  $bestConsoleScore = -1
+  foreach ($handle in [WatchWin]::Every()) {
+    $key = $handle.ToInt64()
+    $owner = [WatchWin]::PidOf($handle)
+    $isNew = -not $baseline.Contains($key)
+    $owned = $PidSet -and $PidSet.Contains([uint32]$owner)
+    if (-not $isNew -and -not $owned) { continue }
+    if ($Known -and ($Known -contains $key)) { continue }
+    if ([WatchWin]::IsToolWindow($handle)) { continue }
+    $class = [WatchWin]::ClassOf($handle)
+    $isConsole = ($class -eq 'ConsoleWindowClass') -or ($class -eq 'PseudoConsoleWindow') -or ($class -eq 'CASCADIA_HOSTING_WINDOW_CLASS')
+    if (-not $isConsole -and ($chromeClasses -contains $class)) { continue }
+    $rx = 0; $ry = 0; $rw = 0; $rh = 0
+    [WatchWin]::Rect($handle, [ref]$rx, [ref]$ry, [ref]$rw, [ref]$rh)
+    # Ignore tiny helper windows (tooltips, IME bars, hidden message windows).
+    if ($rw -lt 160 -or $rh -lt 120) { continue }
+    $visible = [WatchWin]::IsWindowVisible($handle)
+    if (-not $visible -and ($rw * $rh) -lt 200000) { continue }
+    $title = [WatchWin]::TitleOf($handle)
+    if ($TitleContains -ne '' -and -not $title.Contains($TitleContains)) { continue }
+    $score = [int]([Math]::Min(($rw * $rh) / 1000, 900000))
+    if ($title -ne '') { $score += 1000 }
+    if ($owned) { $score += 2000 }
+    $record = [pscustomobject]@{
+      handle = $handle; class = $class; title = $title; pid = [int]$owner
+      x = $rx; y = $ry; w = $rw; h = $rh; visible = $visible
+      console = $isConsole; newWindow = $isNew
+    }
+    if ($isConsole) {
+      if ($score -gt $bestConsoleScore) { $bestConsoleScore = $score; $bestConsole = $record }
+    } elseif ($score -gt $bestScore) {
+      $bestScore = $score
+      $best = $record
+    }
+  }
+  return [pscustomobject]@{ best = $best; console = $bestConsole }
+}
+
+$deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+$roots = @()
+$pidSet = New-Object System.Collections.Generic.HashSet[uint32]
+$known = New-Object System.Collections.Generic.List[Int64]
+
+# Wait for the host to hand over the process ids.
+while ((Get-Date) -lt $deadline) {
+  if (Test-Path -LiteralPath $PidFile) {
+    try {
+      $raw = Get-Content -LiteralPath $PidFile -Raw
+      if ($raw) {
+        $parsed = $raw | ConvertFrom-Json
+        if ($parsed -and $parsed.pids) {
+          $roots = @()
+          foreach ($value in $parsed.pids) { $roots += [uint32]$value; [void]$pidSet.Add([uint32]$value) }
+          break
+        }
+      }
+    } catch { }
+  }
+  Start-Sleep -Milliseconds 10
+}
+
+# The timeout is about waiting for the *window*, so it starts now, not when this
+# watcher was booted.
+$deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+$tree = Get-ProcessTree -Roots $roots
+foreach ($p in $tree) { [void]$pidSet.Add($p) }
+$lastTreeScan = Get-Date
+
+$target = $null
+$consoleFallback = $null
+
+while ((Get-Date) -lt $deadline) {
+  if (((Get-Date) - $lastTreeScan).TotalMilliseconds -ge 300) {
+    $tree = Get-ProcessTree -Roots $roots
+    foreach ($p in $tree) { [void]$pidSet.Add($p) }
+    $lastTreeScan = Get-Date
+  }
+  $found = Get-Candidate -PidSet $pidSet -Known $known
+  if ($found.best) { $target = $found.best; break }
+  if ($found.console) { $consoleFallback = $found.console }
+  Start-Sleep -Milliseconds 12
+}
+
+# Nothing that looks like an app window: fall back to the console box the
+# launcher was started in, which is what a console-only program shows.
+if (-not $target) { $target = $consoleFallback }
+
+if (-not $target) {
+  $none = [pscustomobject]@{
+    ok = $false; reason = 'no-window'; pids = @($pidSet)
+    waitedMs = [int]((Get-Date) - $startedAt).TotalMilliseconds
+  }
+  $noneJson = ConvertTo-Json -InputObject $none -Compress
+  try {
+    # No BOM: the host parses this file with JSON.parse, which rejects \uFEFF.
+    $noneUtf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($OutFile, $noneJson, $noneUtf8)
+  } catch { }
+  $noneJson
+  exit 2
+}
+
+$handle = $target.handle
+$title = $target.title
+$ownerPid = $target.pid
+$firstX = $target.x; $firstY = $target.y; $firstW = $target.w; $firstH = $target.h
+$firstVisible = $target.visible
+$hiddenAt = Get-Date
+
+if ($firstVisible) {
+  [WatchWin]::ShowWindow($handle, [WatchWin]::SW_HIDE) | Out-Null
+}
+
 # Phase 1: place while hidden, then show it (maximize only after it is on the
 # target display).
-Move-Window -Handle $target
-Show-Placed -Handle $target -MaximizeNow ([bool]$Maximize)
+Move-Window -Handle $handle
+Show-Placed -Handle $handle -MaximizeNow ([bool]$Maximize)
 
 # Phase 2: settle. Applications such as the Godot 4 editor restore their own
 # saved geometry (and even their own maximized state) after the first frames, so
 # keep re-asserting the placement for a few seconds instead of trusting one call.
 $attempts = 1
+$replaced = 0
 $maximizeNow = [bool]$Maximize
 $maximizeTries = 0
 $settleUntil = (Get-Date).AddMilliseconds([Math]::Max($SettleMs, 500))
 while ((Get-Date) -lt $settleUntil) {
   Start-Sleep -Milliseconds 50
-  $rect = Get-WindowRect -Handle $target
+
+  # The program may throw its window away and create a new one (engine splash,
+  # renderer switch). Adopt the replacement instead of reporting it as closed.
+  if (-not [WatchWin]::IsWindow($handle)) {
+    [void]$known.Add($handle.ToInt64())
+    $swap = $null
+    $swapDeadline = (Get-Date).AddMilliseconds(1500)
+    while ((Get-Date) -lt $swapDeadline -and -not $swap) {
+      $tree = Get-ProcessTree -Roots $roots
+      foreach ($p in $tree) { [void]$pidSet.Add($p) }
+      $found = Get-Candidate -PidSet $pidSet -Known $known
+      if ($found.best) { $swap = $found.best }
+      else { Start-Sleep -Milliseconds 40 }
+    }
+    if (-not $swap) { break }
+    $target = $swap
+    $handle = $swap.handle
+    $title = $swap.title
+    $ownerPid = $swap.pid
+    $hiddenAt = Get-Date
+    $replaced++
+    if ($swap.visible) { [WatchWin]::ShowWindow($handle, [WatchWin]::SW_HIDE) | Out-Null }
+    Move-Window -Handle $handle
+    Show-Placed -Handle $handle -MaximizeNow $maximizeNow
+    $attempts++
+    continue
+  }
+
+  $rect = Get-WindowRect -Handle $handle
 
   if ($maximizeNow) {
-    if ([WatchWin]::IsZoomed($target) -and (Test-OnMonitor -Rect $rect -Maximized $true)) { continue }
+    if ([WatchWin]::IsZoomed($handle) -and (Test-OnMonitor -Rect $rect -Maximized $true)) { continue }
     # The app dropped the maximized state, or maximized against the monitor it
     # belonged to before we moved it. Re-anchor on the target display first, then
     # maximize again: this is the sequence that actually sticks.
     if ($maximizeTries -ge 6) {
-      [WatchWin]::ShowWindow($target, [WatchWin]::SW_RESTORE) | Out-Null
-      [WatchWin]::ShowWindow($target, [WatchWin]::SW_HIDE) | Out-Null
-      Move-Window -Handle $target
+      [WatchWin]::ShowWindow($handle, [WatchWin]::SW_RESTORE) | Out-Null
+      [WatchWin]::ShowWindow($handle, [WatchWin]::SW_HIDE) | Out-Null
+      Move-Window -Handle $handle
       $maximizeNow = $false
-      Show-Placed -Handle $target -MaximizeNow $false
+      Show-Placed -Handle $handle -MaximizeNow $false
       $attempts++
       continue
     }
-    Move-Window -Handle $target
-    [WatchWin]::ShowWindow($target, [WatchWin]::SW_MAXIMIZE) | Out-Null
+    Move-Window -Handle $handle
+    [WatchWin]::ShowWindow($handle, [WatchWin]::SW_MAXIMIZE) | Out-Null
     $attempts++
     $maximizeTries++
     continue
   }
 
   if (Test-OnTarget -Rect $rect) { continue }
-  if (-not [WatchWin]::IsWindowVisible($target)) {
-    Move-Window -Handle $target
-    Show-Placed -Handle $target -MaximizeNow $false
+  if (-not [WatchWin]::IsWindowVisible($handle)) {
+    Move-Window -Handle $handle
+    Show-Placed -Handle $handle -MaximizeNow $false
     $attempts++
     continue
   }
-  [WatchWin]::ShowWindow($target, [WatchWin]::SW_HIDE) | Out-Null
-  Move-Window -Handle $target
-  Show-Placed -Handle $target -MaximizeNow $false
+  [WatchWin]::ShowWindow($handle, [WatchWin]::SW_HIDE) | Out-Null
+  Move-Window -Handle $handle
+  Show-Placed -Handle $handle -MaximizeNow $false
   $attempts++
 }
 
 # Phase 3: settle the final state and report it honestly.
 # A crashed or self-closing program must not be reported as a placed window.
-if (-not [WatchWin]::IsWindow($target)) {
+if (-not [WatchWin]::IsWindow($handle)) {
   $gone = [pscustomobject]@{
-    ok = $false; reason = 'window-closed'; handle = $target.ToInt64(); pid = $ownerPid
+    ok = $false; reason = 'window-closed'; handle = $handle.ToInt64(); pid = $ownerPid
     title = $title; maximize = [bool]$Maximize; attempts = [int]$attempts
     hidAtMs = [int](([DateTime]$hiddenAt - $startedAt).TotalMilliseconds)
     firstX = $firstX; firstY = $firstY; firstWidth = $firstW; firstHeight = $firstH; firstVisible = $firstVisible
@@ -345,37 +513,37 @@ if (-not [WatchWin]::IsWindow($target)) {
   $goneJson
   exit 3
 }
-if ($maximizeNow -and -not [WatchWin]::IsZoomed($target)) {
-  Move-Window -Handle $target
-  [WatchWin]::ShowWindow($target, [WatchWin]::SW_MAXIMIZE) | Out-Null
+if ($maximizeNow -and -not [WatchWin]::IsZoomed($handle)) {
+  Move-Window -Handle $handle
+  [WatchWin]::ShowWindow($handle, [WatchWin]::SW_MAXIMIZE) | Out-Null
   Start-Sleep -Milliseconds 400
   $attempts++
 }
-$final = Get-WindowRect -Handle $target
-$zoomed = [bool][WatchWin]::IsZoomed($target)
+$final = Get-WindowRect -Handle $handle
+$zoomed = [bool][WatchWin]::IsZoomed($handle)
 $inside = Test-OnMonitor -Rect $final -Maximized ($maximizeNow -and $zoomed)
 if (-not $inside) {
   # Last resort: a plain work-area sized window, the placement every app accepts.
-  [WatchWin]::ShowWindow($target, [WatchWin]::SW_RESTORE) | Out-Null
-  [WatchWin]::ShowWindow($target, [WatchWin]::SW_HIDE) | Out-Null
-  Move-Window -Handle $target
+  [WatchWin]::ShowWindow($handle, [WatchWin]::SW_RESTORE) | Out-Null
+  [WatchWin]::ShowWindow($handle, [WatchWin]::SW_HIDE) | Out-Null
+  Move-Window -Handle $handle
   $maximizeNow = $false
-  Show-Placed -Handle $target -MaximizeNow $false
+  Show-Placed -Handle $handle -MaximizeNow $false
   Start-Sleep -Milliseconds 250
-  $final = Get-WindowRect -Handle $target
-  $zoomed = [bool][WatchWin]::IsZoomed($target)
+  $final = Get-WindowRect -Handle $handle
+  $zoomed = [bool][WatchWin]::IsZoomed($handle)
   $inside = Test-OnMonitor -Rect $final -Maximized $false
   $attempts++
 }
 
 # The title is usually empty at the moment a window is first mapped; re-read it
 # now that the settle loop has given the app time to set it.
-$settledTitle = [WatchWin]::TitleOf($target)
+$settledTitle = [WatchWin]::TitleOf($handle)
 if ($settledTitle) { $title = $settledTitle }
 $payload = [pscustomobject]@{
   ok            = $inside
   reason        = if ($inside) { $null } else { 'outside-target-display' }
-  handle        = $target.ToInt64()
+  handle        = $handle.ToInt64()
   pid           = $ownerPid
   title         = $title
   x             = $final.x
@@ -388,6 +556,9 @@ $payload = [pscustomobject]@{
   zoomed        = [bool]$zoomed
   inside        = [bool]$inside
   attempts      = [int]$attempts
+  replaced      = [int]$replaced
+  console       = [bool]$target.console
+  class         = $target.class
   targetX       = $X
   targetY       = $Y
   targetWidth   = $W
