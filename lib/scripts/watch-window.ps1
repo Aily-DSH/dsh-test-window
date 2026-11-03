@@ -133,6 +133,28 @@ public static class WatchWin {
     return found;
   }
 
+  /// <summary>
+  /// Windows worth looking at: owned by one of `pids`, or not present in the
+  /// pre-launch snapshot `before` (so a window the launcher handed to another
+  /// process is still found). Filtering here keeps the polling loop cheap.
+  /// </summary>
+  public static List<IntPtr> Candidates(uint[] pids, long[] before) {
+    uint self = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+    var wanted = new HashSet<uint>(pids);
+    var known = new HashSet<long>(before);
+    var found = new List<IntPtr>();
+    EnumWindows((hWnd, lParam) => {
+      uint pid;
+      GetWindowThreadProcessId(hWnd, out pid);
+      if (pid == self) return true;
+      bool owned = pids.Length > 0 && wanted.Contains(pid);
+      if (!owned && known.Contains(hWnd.ToInt64())) return true;
+      found.Add(hWnd);
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
+
   public static string TitleOf(IntPtr hWnd) {
     var sb = new StringBuilder(512);
     GetWindowTextW(hWnd, sb, sb.Capacity);
@@ -207,8 +229,14 @@ $helperClasses = @(
 # Everything that is already on screen before the program starts. A window that
 # is not in here appeared because of this launch, even when the launcher handed
 # the program to another process (explorer, a service, an existing instance).
+$baselineHandles = [WatchWin]::Every()
+$baselineKeys = New-Object 'System.Collections.Generic.List[Int64]'
 $baseline = New-Object System.Collections.Generic.HashSet[Int64]
-foreach ($handle in [WatchWin]::Every()) { [void]$baseline.Add($handle.ToInt64()) }
+foreach ($handle in $baselineHandles) {
+  $key = $handle.ToInt64()
+  if ($baseline.Add($key)) { $baselineKeys.Add($key) }
+}
+[Int64[]]$baselineArray = $baselineKeys.ToArray()
 
 # Ready handshake: the host waits for this file, so the program is only started
 # once the watcher is already polling.
@@ -314,7 +342,9 @@ function Get-Candidate {
   $bestScore = -1
   $bestConsole = $null
   $bestConsoleScore = -1
-  foreach ($handle in [WatchWin]::Every()) {
+  [uint32[]]$pidArray = @()
+  if ($PidSet -and $PidSet.Count -gt 0) { $pidArray = [uint32[]]@($PidSet) }
+  foreach ($handle in [WatchWin]::Candidates($pidArray, $baselineArray)) {
     $key = $handle.ToInt64()
     $owner = [WatchWin]::PidOf($handle)
     $isNew = -not $baseline.Contains($key)
