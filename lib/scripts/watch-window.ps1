@@ -195,6 +195,15 @@ $chromeClasses = @(
   'Windows.UI.Core.CoreWindow', 'ApplicationManager_ImmersiveShellWindow'
 )
 
+# GPU drivers create invisible scratch windows while an engine initialises its
+# context (Godot 4 on NVIDIA: class NVOpenGLPbuffer, title __wglDummyWindowFo…
+# sized like the render surface). They are never what the user calls the test
+# window, and picking one used to eat the whole placement.
+$helperClasses = @(
+  'NVOpenGLPbuffer', 'NVOpenGLWindow', 'GDI+ Window', 'OleMainThreadWndClass',
+  'D3D9Window', 'DDrawWindow', 'MediaContextNotificationWindow'
+)
+
 # Everything that is already on screen before the program starts. A window that
 # is not in here appeared because of this launch, even when the launcher handed
 # the program to another process (explorer, a service, an existing instance).
@@ -314,15 +323,20 @@ function Get-Candidate {
     if ($Known -and ($Known -contains $key)) { continue }
     if ([WatchWin]::IsToolWindow($handle)) { continue }
     $class = [WatchWin]::ClassOf($handle)
+    if ($helperClasses -contains $class) { continue }
     $isConsole = ($class -eq 'ConsoleWindowClass') -or ($class -eq 'PseudoConsoleWindow') -or ($class -eq 'CASCADIA_HOSTING_WINDOW_CLASS')
     if (-not $isConsole -and ($chromeClasses -contains $class)) { continue }
     $rx = 0; $ry = 0; $rw = 0; $rh = 0
     [WatchWin]::Rect($handle, [ref]$rx, [ref]$ry, [ref]$rw, [ref]$rh)
     # Ignore tiny helper windows (tooltips, IME bars, hidden message windows).
     if ($rw -lt 160 -or $rh -lt 120) { continue }
-    $visible = [WatchWin]::IsWindowVisible($handle)
-    if (-not $visible -and ($rw * $rh) -lt 200000) { continue }
+    # Only a window the user can actually see is the test window. Engines and
+    # drivers keep invisible windows around (see $helperClasses above) that are
+    # easy to mistake for the real thing; the real window is mapped, then shown.
+    if (-not [WatchWin]::IsWindowVisible($handle)) { continue }
+    $visible = $true
     $title = [WatchWin]::TitleOf($handle)
+    if ($title.StartsWith('__wgl')) { continue }
     if ($TitleContains -ne '' -and -not $title.Contains($TitleContains)) { continue }
     $score = [int]([Math]::Min(($rw * $rh) / 1000, 900000))
     if ($title -ne '') { $score += 1000 }
